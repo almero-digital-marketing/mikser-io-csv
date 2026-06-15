@@ -62,6 +62,7 @@ export function csv(options = {}) {
         runtime, onLoaded, onImport, onProcess, useLogger, useJournal,
         createEntity, updateEntity, deleteEntity,
         findEntity,
+        triggeredHook,
         constants: { OPERATION },
     }) => {
         const match = options.match ?? {}
@@ -122,15 +123,28 @@ export function csv(options = {}) {
                 logger.info('Csv: registered URL source %s → %s', key, parentId)
 
                 // Poll timer (watch mode only). Each tick UPDATEs the
-                // parent entity; onProcess picks it up; fanout runs;
-                // the http provider's ETag cache shortcuts the actual
-                // re-fetch when there's nothing new.
+                // parent entity AND fires triggeredHook so the watch
+                // loop actually wakes up and drains the journal —
+                // updateEntity alone just appends a row; without the
+                // trigger, the engine's processTimeout never re-arms
+                // and the row sits forever waiting for a chokidar
+                // event to flush it. onProcess then picks the bump
+                // up, fanout runs, the http provider's ETag cache
+                // shortcuts the actual re-fetch when there's nothing
+                // new.
                 const pollIntervalMs = entry.pollIntervalMs ?? options.pollIntervalMs ?? 60_000
                 if (runtime.options.watch && pollIntervalMs > 0) {
-                    const t = setInterval(() => {
-                        updateEntity({ ...parent, time: Date.now() }).catch(err => {
+                    const t = setInterval(async () => {
+                        try {
+                            await updateEntity({ ...parent, time: Date.now() })
+                            // Wake the watch loop. The 1s debounce in
+                            // triggeredHook collapses bursts (multiple
+                            // sources polling in the same window) into
+                            // a single process cycle.
+                            await triggeredHook('csv-poll', { url: key, parentId })
+                        } catch (err) {
                             logger.error('Csv: poll bump failed for %s — %s', key, err.message)
-                        })
+                        }
                     }, pollIntervalMs)
                     t.unref?.()
                     pollTimers.push(t)
