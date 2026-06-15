@@ -40,20 +40,20 @@ function urlToParentId(url, configParentId) {
 
 function validateEntry(key, entry) {
     if (!entry || typeof entry !== 'object') {
-        throw new Error(`csv: match[${JSON.stringify(key)}] must be a config object`)
+        throw new Error(`Csv: match[${JSON.stringify(key)}] must be a config object`)
     }
     if (!entry.idColumn || typeof entry.idColumn !== 'string') {
         throw new Error(
-            `csv: match[${JSON.stringify(key)}] requires an idColumn (string column name). ` +
+            `Csv: match[${JSON.stringify(key)}] requires an idColumn (string column name). ` +
             `Pick the column whose values uniquely identify a row; without it, change detection ` +
             `would treat every edit as wholesale delete+recreate.`
         )
     }
     if (!entry.prefix || typeof entry.prefix !== 'string') {
-        throw new Error(`csv: match[${JSON.stringify(key)}] requires a prefix (string, mikser-side id prefix for row entities)`)
+        throw new Error(`Csv: match[${JSON.stringify(key)}] requires a prefix (string, mikser-side id prefix for row entities)`)
     }
     if (!entry.collection || typeof entry.collection !== 'string') {
-        throw new Error(`csv: match[${JSON.stringify(key)}] requires a collection (string)`)
+        throw new Error(`Csv: match[${JSON.stringify(key)}] requires a collection (string)`)
     }
 }
 
@@ -83,7 +83,7 @@ export function csv(options = {}) {
         }
 
         if (entries.length === 0) {
-            onLoaded(() => useLogger().warn('csv: no `match` entries configured — plugin is inert.'))
+            onLoaded(() => useLogger().warn('Csv: no `match` entries configured — plugin is inert.'))
             return
         }
 
@@ -119,7 +119,7 @@ export function csv(options = {}) {
                 } else {
                     await createEntity(parent)
                 }
-                logger.info('csv: registered URL source %s → %s', key, parentId)
+                logger.info('Csv: registered URL source %s → %s', key, parentId)
 
                 // Poll timer (watch mode only). Each tick UPDATEs the
                 // parent entity; onProcess picks it up; fanout runs;
@@ -129,12 +129,12 @@ export function csv(options = {}) {
                 if (runtime.options.watch && pollIntervalMs > 0) {
                     const t = setInterval(() => {
                         updateEntity({ ...parent, time: Date.now() }).catch(err => {
-                            logger.error('csv: poll bump failed for %s — %s', key, err.message)
+                            logger.error('Csv: poll bump failed for %s — %s', key, err.message)
                         })
                     }, pollIntervalMs)
                     t.unref?.()
                     pollTimers.push(t)
-                    logger.info('csv: polling %s every %dms', key, pollIntervalMs)
+                    logger.info('Csv: polling %s every %dms', key, pollIntervalMs)
                 }
             }
         })
@@ -185,7 +185,7 @@ export function csv(options = {}) {
                     for (const rowEntityId of orphaned) {
                         await deleteEntity({ id: rowEntityId, collection: entry.collection })
                     }
-                    logger.info('csv: parent %s deleted — cleaned up %d row entities', entity.id, orphaned.length)
+                    logger.info('Csv: parent %s deleted — cleaned up %d row entities', entity.id, orphaned.length)
                     continue
                 }
 
@@ -205,7 +205,7 @@ export function csv(options = {}) {
                         logger,
                     })
                 } catch (err) {
-                    logger.error('csv: fanout failed for %s — %s', entity.id, err.message)
+                    logger.error('Csv: fanout failed for %s — %s', entity.id, err.message)
                 }
             }
         })
