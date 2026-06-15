@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import { compileFilter } from './lib/filter.js'
 import { fanoutParent } from './lib/fanout.js'
 import { isUrlKey, findMatchingKey } from './lib/match-key.js'
+import { dropAllForParent } from './lib/state.js'
 import './lib/state.js'   // side-effect: registerSchema
 
 function urlToParentId(url, configParentId) {
@@ -168,9 +169,25 @@ export function csv(options = {}) {
             )) {
                 if (signal.aborted) return
 
-                // DELETEs cascade automatically through FK; nothing
-                // for the fanout to do on parent delete.
-                if (operation === OPERATION.DELETE) continue
+                // Parent CSV deleted → drop the per-row state we own
+                // AND emit deleteEntity for every row entity. We can't
+                // rely on FK cascade (mikser_csv_state has no FK to
+                // mikser_entities — onProcess fires while pending
+                // CREATEs are still draining and would block the
+                // initial state row from being written). Explicit
+                // cleanup is the price.
+                if (operation === OPERATION.DELETE) {
+                    if (entity?.format === 'csv-row') continue
+                    const matched = findMatchingKey(entity, match, parentIdByUrl)
+                    if (!matched) continue
+                    const entry = configByKey.get(matched)
+                    const orphaned = dropAllForParent(entity.id)
+                    for (const rowEntityId of orphaned) {
+                        await deleteEntity({ id: rowEntityId, collection: entry.collection })
+                    }
+                    logger.info('csv: parent %s deleted — cleaned up %d row entities', entity.id, orphaned.length)
+                    continue
+                }
 
                 // Don't re-fan our own row entities (format = csv-row).
                 if (entity?.format === 'csv-row') continue
