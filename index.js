@@ -18,10 +18,11 @@
 // is the parent-entity bootstrap and the poll timer.
 
 import { createHash } from 'node:crypto'
+import { readEntityContent } from 'mikser-io'
 import { compileFilter } from './lib/filter.js'
 import { fanoutParent } from './lib/fanout.js'
 import { isUrlKey, findMatchingKey } from './lib/match-key.js'
-import { dropAllForParent } from './lib/state.js'
+import { dropAllForParent, getParentState } from './lib/state.js'
 import './lib/state.js'   // side-effect: registerSchema
 
 function urlToParentId(url, configParentId) {
@@ -122,28 +123,52 @@ export function csv(options = {}) {
                 }
                 logger.info('Csv: registered URL source %s → %s', key, parentId)
 
-                // Poll timer (watch mode only). Each tick UPDATEs the
-                // parent entity AND fires triggeredHook so the watch
-                // loop actually wakes up and drains the journal —
-                // updateEntity alone just appends a row; without the
-                // trigger, the engine's processTimeout never re-arms
-                // and the row sits forever waiting for a chokidar
-                // event to flush it. onProcess then picks the bump
-                // up, fanout runs, the http provider's ETag cache
-                // shortcuts the actual re-fetch when there's nothing
-                // new.
+                // Poll timer (watch mode only). Each tick does a CHEAP
+                // change check before disturbing anything — fetch via
+                // the http provider (conditional GET; nearly free when
+                // the upstream serves 304 within its cache window),
+                // checksum the body, compare against the persisted
+                // parent checksum. If unchanged, the tick is silent:
+                // no journal write, no trigger, no render cycle. Only
+                // when the bytes actually differ do we bump the entity
+                // and wake the watch loop.
+                //
+                // The previous design bumped on every tick and let the
+                // process cycle discover "nothing changed" via the same
+                // checksum compare inside fanout. That worked but spun
+                // a full cycle every poll interval — wasted CPU, wasted
+                // log noise, and at scale (many polled CSVs) wasted
+                // contention on the journal/manifest path. Cheaper to
+                // gate at the source.
                 const pollIntervalMs = entry.pollIntervalMs ?? options.pollIntervalMs ?? 60_000
                 if (runtime.options.watch && pollIntervalMs > 0) {
                     const t = setInterval(async () => {
                         try {
+                            const content = await readEntityContent(parent)
+                            if (content.contentError) {
+                                logger.warn('Csv: poll fetch for %s failed: %s', key, content.contentError)
+                                return
+                            }
+                            if (typeof content.content !== 'string') return
+                            const checksum = createHash('sha256').update(content.content).digest('hex')
+                            const prev = getParentState(parentId)?.file_checksum
+                            if (prev === checksum) {
+                                logger.trace('Csv: poll %s — unchanged, no cycle', key)
+                                return
+                            }
+                            // Changed. Bump entity time so the UPDATE
+                            // lands in the journal, then trigger a
+                            // cycle to drain it. Fanout in onProcess
+                            // re-fetches (cheap via http provider's
+                            // ETag cache — same response served from
+                            // the in-memory cache) and runs the diff.
+                            // The 1s debounce in triggeredHook collapses
+                            // bursts (multiple sources detecting changes
+                            // in the same window) into one cycle.
                             await updateEntity({ ...parent, time: Date.now() })
-                            // Wake the watch loop. The 1s debounce in
-                            // triggeredHook collapses bursts (multiple
-                            // sources polling in the same window) into
-                            // a single process cycle.
                             await triggeredHook('csv-poll', { url: key, parentId })
                         } catch (err) {
-                            logger.error('Csv: poll bump failed for %s — %s', key, err.message)
+                            logger.error('Csv: poll check failed for %s — %s', key, err.message)
                         }
                     }, pollIntervalMs)
                     t.unref?.()
