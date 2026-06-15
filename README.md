@@ -163,13 +163,15 @@ parent CSV entity in catalog (uri = local path / gdrive://... / https://...)
    ▼ fanoutParent:
    │   1. readEntityContent(parent) — substrate-side provider dispatch
    │      (fs / gdrive / http — whichever scheme the URI has)
-   │   2. sha256 the body → checksum gate (unchanged → skip)
+   │   2. sha256 the body → compare against parent.checksum → skip if equal
    │   3. parseCsv + coerce
    │   4. filter (sift) → keep / drop rows
    │   5. indexByKey by idColumn → Map<rowKey, {row, rowHash}>
    │   6. threeWayDiff against mikser_csv_rows
    │   7. emit createEntity / updateEntity / deleteEntity per delta
-   │   8. persist new file_checksum + row hashes
+   │   8. mutate parent.checksum + parent.meta.csvColumns
+   │      (auto-persist via useJournal carries it to mikser_entities)
+   │   9. upsert row_hash entries
    │
    ▼ row entities now in the catalog
 ```
@@ -180,12 +182,12 @@ Filtered-out rows look indistinguishable from removed rows — they just aren't 
 
 When a match key is an HTTP/HTTPS URL:
 
-1. **At `onLoaded`:** csv plugin creates a parent entity (or updates if it already exists) with `uri = <the URL>`, `meta.httpHeaders = <your headers>`, `meta.httpTimeoutMs = <yours>`. The id is derived from the URL hash (or `parentId` if you set it).
-2. **At `onImport` (cold runs):** runs fanout once so first-run ingests rows without waiting for the first poll tick.
-3. **In watch mode:** a `setInterval(pollIntervalMs)` bumps `parent.time`, calling `updateEntity` — that triggers the same `onProcess` path the filesystem mode uses.
-4. **Fetching:** `readEntityContent(parent)` routes to the **built-in `http` provider** (`mikser-io-core`, no separate package), which sends conditional GETs with `If-None-Match` from its in-memory ETag cache. A 304 reuses the cached body → the fanout's checksum gate sees an unchanged file → skip.
+1. **At `onLoaded`:** csv plugin creates a parent entity (or updates if it already exists) with `uri = <the URL>`, `meta.httpHeaders = <your headers>`, `meta.httpTimeoutMs = <yours>`. The id is derived from the URL hash (or `parentId` if you set it). On warm restart, the previous run's `parent.checksum` is preserved so the next cycle stays silent when the upstream hasn't drifted.
+2. **At `onProcess` (cold + warm runs):** the CREATE/UPDATE journal entry from `onLoaded` is yielded; `fanoutParent` runs and ingests rows. No separate `onImport` pass — `onProcess` is the single fanout entrypoint for both startup and steady-state.
+3. **In watch mode:** a `setInterval(pollIntervalMs)` does a **cheap change check at the source** — fetches via the http provider (304 inside the upstream's cache window), checksums the body, compares with the entity's `checksum`. Unchanged → silent return. Changed → bump `parent.time`, call `triggeredHook` to wake the watch loop, and the same `onProcess` path runs fanout. The gate at the poll means an unchanged URL produces zero process cycles.
+4. **Fetching:** `readEntityContent(parent)` routes to the **built-in `http` provider** (ships in `mikser-io`, no separate package), which sends conditional GETs with `If-None-Match` from its in-memory ETag cache. A 304 reuses the cached body → checksum unchanged → poll returns silent.
 
-Effectively: a poll on an unchanged URL costs **one 304 round-trip + a checksum compare**. Polling a 50MB CSV at 60s intervals is nearly free as long as the server sets ETags (S3, GCS, Cloudflare, Netlify, raw.githubusercontent.com all do).
+Effectively: a poll on an unchanged URL costs **one 304 round-trip + a checksum compare** and does not start a process cycle. Polling a 50MB CSV at 60s intervals is nearly free as long as the server sets ETags (S3, GCS, Cloudflare, Netlify, raw.githubusercontent.com all do).
 
 ## End-to-end demo: Google Sheets → product pages
 
@@ -224,22 +226,21 @@ Each row in the sheet renders to `/products/<sku>.html`. Edit a cell in Google S
 
 ## State persistence
 
+Parent-level state lives **on the parent entity itself** — `parent.checksum` (sha256 of the last successfully-parsed CSV body; the fast skip-if-unchanged gate) and `parent.meta.csvColumns` (column-order snapshot, diagnostic). Both ride on `mikser_entities` via the standard catalog write path, so there's one schema to evolve and one place to look when investigating why a poll didn't pick something up.
+
+Per-row state has its own table because there can be many rows per parent and the diff needs them keyed:
+
 ```sql
-mikser_csv_state (
-    parent_id          PRIMARY KEY → mikser_entities(id) ON DELETE CASCADE,
-    file_checksum,
-    columns_json,
-    last_scanned_at
-);
 mikser_csv_rows (
     parent_id, row_key,
     entity_id, row_hash, last_seen_at,
-    PRIMARY KEY (parent_id, row_key),
-    FK parent_id → mikser_entities(id) ON DELETE CASCADE
+    PRIMARY KEY (parent_id, row_key)
 );
 ```
 
-Lives in `runtime/mikser.sqlite` via `registerSchema`. Parent CSV deleted → cascade drops all row state. `--clear` wipes state and forces a fresh fanout regardless of file checksum.
+Lives in `runtime/mikser.sqlite` via `registerSchema`. No FK to `mikser_entities`: `onProcess` runs while the parent's own CREATE journal entry may still be pending, and a FK would block the row-state writes that fanout is producing in the same iteration. Cleanup-on-parent-delete is handled explicitly in the `onProcess` `DELETE` branch (`dropAllForParent` walks the row state and emits `deleteEntity` for each row entity).
+
+`--clear` wipes the catalog (and with it the entity-borne checksum + columns) and forces a fresh fanout regardless of any previous state.
 
 ## What v1 does NOT cover
 
@@ -273,7 +274,7 @@ Run `mikser --debug` and check the "csv: <id> — N parsed, M passed filter (K e
 
 ### Same row gets repeatedly updated even when source hasn't changed
 
-The file_checksum changed even though it shouldn't have. Causes:
+`parent.checksum` differs from the previous run's even though the data didn't really change. Causes:
 - Trailing whitespace or BOM differences between exports.
 - Date columns where the export changes timezone (e.g. `2026-06-15T00:00:00+00:00` vs `2026-06-15T00:00:00Z`).
 - Empty trailing rows added/removed by the exporting tool.

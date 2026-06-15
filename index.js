@@ -22,7 +22,7 @@ import { readEntityContent } from 'mikser-io'
 import { compileFilter } from './lib/filter.js'
 import { fanoutParent } from './lib/fanout.js'
 import { isUrlKey, findMatchingKey } from './lib/match-key.js'
-import { dropAllForParent, getParentState } from './lib/state.js'
+import { dropAllForParent } from './lib/state.js'
 import './lib/state.js'   // side-effect: registerSchema
 
 function urlToParentId(url, configParentId) {
@@ -60,7 +60,7 @@ function validateEntry(key, entry) {
 
 export function csv(options = {}) {
     return ({
-        runtime, onLoaded, onImport, onProcess, useLogger, useJournal,
+        runtime, onLoaded, onProcess, useLogger, useJournal,
         createEntity, updateEntity, deleteEntity,
         findEntity,
         triggeredHook,
@@ -90,9 +90,9 @@ export function csv(options = {}) {
         }
 
         // For each URL entry, create the parent CSV entity at onLoaded
-        // and schedule polling. We bump the entity on every poll tick;
-        // the http provider's ETag cache makes the actual fetch nearly
-        // free when the URL hasn't changed.
+        // and schedule polling. The CREATE/UPDATE from this call lands
+        // a journal entry that onProcess (below) picks up and runs the
+        // initial fanout for — no separate onImport pass needed.
         const pollTimers = []
         onLoaded(async () => {
             const logger = useLogger()
@@ -107,6 +107,13 @@ export function csv(options = {}) {
                     name:       parentId.split('/').pop().replace(/\.csv$/i, ''),
                     format:     'csv',
                     uri:        key,
+                    // Carry checksum forward on warm restart so the
+                    // gate hits and the first cycle is silent when the
+                    // upstream hasn't drifted since shutdown. Without
+                    // this preservation the bump in onLoaded would
+                    // clear it, fanout would re-run, diff would emit
+                    // zero row changes — wasteful but quiet.
+                    checksum:   existing?.checksum,
                     meta: {
                         ...(existing?.meta ?? {}),
                         csvSource:     'http',
@@ -144,15 +151,22 @@ export function csv(options = {}) {
                 if (runtime.options.watch && pollIntervalMs > 0) {
                     const t = setInterval(async () => {
                         try {
-                            const content = await readEntityContent(parent)
+                            // Read fresh catalog state each tick — the
+                            // closure-captured `parent` from onLoaded
+                            // is stale the moment fanout runs the first
+                            // time (parent.checksum gets set). findEntity
+                            // returns whatever's currently in mikser_entities,
+                            // including any checksum the last fanout left.
+                            const current = await findEntity({ id: parentId })
+                            if (!current) return        // catalog dropped it; let it stay gone
+                            const content = await readEntityContent(current)
                             if (content.contentError) {
                                 logger.warn('Csv: poll fetch for %s failed: %s', key, content.contentError)
                                 return
                             }
                             if (typeof content.content !== 'string') return
                             const checksum = createHash('sha256').update(content.content).digest('hex')
-                            const prev = getParentState(parentId)?.file_checksum
-                            if (prev === checksum) {
+                            if (current.checksum === checksum) {
                                 logger.trace('Csv: poll %s — unchanged, no cycle', key)
                                 return
                             }
@@ -161,11 +175,13 @@ export function csv(options = {}) {
                             // cycle to drain it. Fanout in onProcess
                             // re-fetches (cheap via http provider's
                             // ETag cache — same response served from
-                            // the in-memory cache) and runs the diff.
-                            // The 1s debounce in triggeredHook collapses
-                            // bursts (multiple sources detecting changes
-                            // in the same window) into one cycle.
-                            await updateEntity({ ...parent, time: Date.now() })
+                            // the in-memory cache), computes the same
+                            // new checksum, mutates current.checksum,
+                            // and runs the row diff. The 1s debounce
+                            // in triggeredHook collapses bursts
+                            // (multiple sources detecting changes in
+                            // the same window) into one cycle.
+                            await updateEntity({ ...current, time: Date.now() })
                             await triggeredHook('csv-poll', { url: key, parentId })
                         } catch (err) {
                             logger.error('Csv: poll check failed for %s — %s', key, err.message)
@@ -178,26 +194,12 @@ export function csv(options = {}) {
             }
         })
 
-        // onImport: trigger one fanout per URL parent at startup so
-        // cold runs ingest rows without waiting for the first poll tick.
-        // Glob-mode parents flow through onProcess naturally when the
-        // documents/files/gdrive plugins emit their journal entries.
-        onImport(async () => {
-            const logger = useLogger()
-            for (const [key, entry] of entries) {
-                if (!isUrlKey(key)) continue
-                const parentId = parentIdByUrl.get(key)
-                const parent = await findEntity({ id: parentId })
-                if (!parent) continue
-                await fanoutParent({
-                    parent, key,
-                    config: { ...entry, force: runtime.options.clear },
-                    compiledFilter: compiledByKey.get(key),
-                    createEntity, updateEntity, deleteEntity,
-                    logger,
-                })
-            }
-        })
+        // Note: no separate onImport pass for URL mode. onLoaded's
+        // createEntity/updateEntity lands a CREATE/UPDATE journal
+        // entry for each URL parent; onProcess (below) picks it up
+        // and runs the initial fanout. Glob-mode parents flow through
+        // the same onProcess path naturally — their CREATE/UPDATE
+        // entries come from the documents/files/gdrive sources.
 
         onProcess(async (signal) => {
             const logger = useLogger()
@@ -210,7 +212,7 @@ export function csv(options = {}) {
 
                 // Parent CSV deleted → drop the per-row state we own
                 // AND emit deleteEntity for every row entity. We can't
-                // rely on FK cascade (mikser_csv_state has no FK to
+                // rely on FK cascade (mikser_csv_rows has no FK to
                 // mikser_entities — onProcess fires while pending
                 // CREATEs are still draining and would block the
                 // initial state row from being written). Explicit
