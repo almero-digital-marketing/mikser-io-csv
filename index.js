@@ -24,6 +24,13 @@ import { fanoutParent } from './lib/fanout.js'
 import { isUrlKey, findMatchingKey } from './lib/match-key.js'
 import { dropAllForParent } from './lib/state.js'
 import './lib/state.js'   // side-effect: registerSchema
+import { registerCsvProvenance } from './lib/provenance.js'
+
+// A row entity is synthetic, so "where was this written" has no answer from
+// the entity alone — but every value was written on one line of the parent
+// csv, which is a real place to go and edit. Registered once at module scope;
+// it costs nothing until something asks.
+registerCsvProvenance()
 
 function urlToParentId(url, configParentId) {
     if (configParentId) return configParentId
