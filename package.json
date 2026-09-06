@@ -1,7 +1,7 @@
 {
   "name": "mikser-io-csv",
-  "version": "2.0.0",
-  "description": "CSV-as-source for mikser-io. Local files / Drive sheets exported as CSV / HTTP URL polling \u2014 same dispatch. Each row becomes a queryable entity; idColumn picks the stable key; sift-based filter pre-excludes rows; opt-in type coercion; checksum-gated re-emit on parent file change; three-way row diff per refresh.",
+  "version": "11.0.1",
+  "description": "CSV-as-source for mikser-io. Local files / Drive sheets exported as CSV / HTTP URL polling — same dispatch. Each row becomes a queryable entity; idColumn picks the stable key; sift-based filter pre-excludes rows; opt-in type coercion; checksum-gated re-emit on parent file change; three-way row diff per refresh.",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -18,7 +18,7 @@
   },
   "homepage": "https://github.com/almero-digital-marketing/mikser-io-csv#readme",
   "peerDependencies": {
-    "mikser-io": "^10.0.0"
+    "mikser-io": "^11.0.1"
   },
   "dependencies": {
     "csv-parse": "^5.5.0",
@@ -26,6 +26,6 @@
     "sift": "^17.0.0"
   },
   "devDependencies": {
-    "mikser-io": "^10.0.0"
+    "mikser-io": "^11.0.1"
   }
 }
