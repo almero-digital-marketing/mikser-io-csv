@@ -26,7 +26,7 @@ This is the "spreadsheet-as-CMS" story for non-technical operators: marketing dr
 npm install mikser-io-csv
 ```
 
-Peer dep on `mikser-io ^9`. Hard deps: `csv-parse` (the parser), `sift` (filter dispatch), `minimatch` (glob match).
+Peer dep on `mikser-io ^11`. Hard deps: `csv-parse` (the parser), `sift` (filter dispatch), `minimatch` (glob match).
 
 ## Two operating modes — one factory
 
@@ -90,6 +90,9 @@ Detection: a key starting with `http://` or `https://` is URL mode; anything els
 | `coerce` | `false` | `true` → auto-detect numbers / booleans / ISO dates per cell. Object → explicit per-column types (`{ price: 'number', placedAt: 'date' }`). Conservative — leading-zero strings stay strings. |
 | `filter` | none | Sift query object OR `(row, ctx) => boolean`. Compile-once; rows that fail are excluded from the catalog (and treated as deletes if they were previously present). |
 | `delimiter` | `,` | `'\t'` for TSV, `';'` for European CSV. |
+| `quote` | `"` | `false` turns quoting off. TSV has no quoting convention — a tab separates fields and a `"` is literal — but csv-parse still defaults to `"`, so a cell a spreadsheet exports as `"BRAND"()` fails the whole file with `Invalid Closing Quote`. |
+| `relaxColumnCount` | `false` | Tolerate a row whose field count differs from the header's; missing columns come back `null`. Off by default because in a real CSV a length mismatch usually means the delimiter is wrong, and that should be loud. |
+| `parseOptions` | none | Escape hatch: merged last over the fields above, for a csv-parse option this plugin has no opinion about. |
 | `headerless` | `false` | `true` → first row is data; you must also pass `columns: [...]`. |
 | `columns` | — | Required when `headerless: true`. |
 | `parentId` | derived from URL | (URL mode only) Override the auto-derived parent entity id. |

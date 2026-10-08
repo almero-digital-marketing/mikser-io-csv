@@ -127,3 +127,41 @@ describe('parseCsv — coercion: per-column object', () => {
         assert.equal(rows[0].price, '19.99')
     })
 })
+
+describe('parseCsv — TSV and ragged sheets', () => {
+    it('quote: false treats a double quote as a literal character', () => {
+        // A spreadsheet exports a cell like `"CELESTETIC"()` verbatim. TSV has no
+        // quoting convention, but csv-parse still defaults to quote: '"' and dies
+        // with Invalid Closing Quote — taking the whole file, not just the cell.
+        const tsv = 'brand\tname\n"CELESTETIC"()\tSoftClean'
+        assert.throws(() => parseCsv(tsv, { delimiter: '\t' }), /Invalid Closing Quote/)
+
+        const { rows } = parseCsv(tsv, { delimiter: '\t', quote: false })
+        assert.equal(rows.length, 1)
+        assert.equal(rows[0].brand, '"CELESTETIC"()')
+        assert.equal(rows[0].name, 'SoftClean')
+    })
+
+    it('relaxColumnCount tolerates a short row, and is off by default', () => {
+        // Off by default on purpose: in a real CSV a length mismatch usually
+        // means the delimiter is wrong, and that should be loud.
+        const csv = 'a,b,c\n1,2,3\n4,5'
+        assert.throws(() => parseCsv(csv), /Invalid Record Length/)
+
+        const { rows } = parseCsv(csv, { relaxColumnCount: true })
+        assert.equal(rows.length, 2)
+        assert.equal(rows[1].a, '4')
+        assert.equal(rows[1].c, null)   // csv-parse fills a missing column with null, not undefined
+    })
+
+    it('a tab-delimited file with comma-bearing values parses on delimiter alone', () => {
+        // "9,300 €" is why the delimiter matters here rather than being cosmetic:
+        // parsed as CSV the price splits in two and the record no longer matches
+        // the header.
+        const tsv = 'device\tsku\tprice\nNOVAPRESS\tLC0002201\t9,300 €'
+        assert.throws(() => parseCsv(tsv), /Invalid Record Length/)
+
+        const { rows } = parseCsv(tsv, { delimiter: '\t' })
+        assert.equal(rows[0].price, '9,300 €')
+    })
+})
