@@ -18,6 +18,14 @@ describe('parserOptionsFrom — the documented entry fields reach the parser', (
         assert.equal(options.relaxColumnCount, true)
     })
 
+    it('maps headerRow and lineColumn', () => {
+        const options = parserOptionsFrom({
+            idColumn: 'row', prefix: '/p/', collection: 'documents', headerRow: 2, lineColumn: 'row',
+        })
+        assert.equal(options.headerRow, 2)
+        assert.equal(options.lineColumn, 'row')
+    })
+
     it('omits what was not configured, so parseCsv keeps its own defaults', () => {
         const options = parserOptionsFrom({ idColumn: 'sku', prefix: '/p/', collection: 'documents' })
         assert.ok(!('delimiter' in options))

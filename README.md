@@ -95,6 +95,8 @@ Detection: a key starting with `http://` or `https://` is URL mode; anything els
 | `parseOptions` | none | Escape hatch: merged last over the fields above, for a csv-parse option this plugin has no opinion about. |
 | `headerless` | `false` | `true` → first row is data; you must also pass `columns: [...]`. |
 | `columns` | — | Required when `headerless: true`. |
+| `headerRow` | `1` | The line (1-based) that names the columns; lines above it are not read. For a sheet with a row of readable titles over the row of keys, set `2`. |
+| `lineColumn` | none | Adds a column of this name to every row, holding the line the row starts on (1-based, as the spreadsheet numbers rows). Use it as `idColumn` when no column identifies a row on its own. Refused if the csv already has a column of that name. |
 | `parentId` | derived from URL | (URL mode only) Override the auto-derived parent entity id. |
 | `pollIntervalMs` | plugin-level default (60s) | (URL mode only) How often to poll this URL. |
 | `headers` | none | (URL mode only) HTTP headers passed through to the built-in http provider (Authorization tokens, custom Accept, etc.). |
@@ -226,6 +228,24 @@ Effectively: a poll on an unchanged URL costs **one 304 round-trip + a checksum 
    ```
 
 Each row in the sheet renders to `/products/<sku>.html`. Edit a cell in Google Sheets, ~2 minutes later the corresponding page updates. Marketing team never touches mikser; their workflow is "edit the sheet."
+
+### A sheet written for people: titles over keys, no key column
+
+A table someone edits by hand often has a row of readable titles above the row of keys, and rows that no single column tells apart: a rule table where two rows share every value that names them and differ only in their conditions. Publish it as TSV, take the keys from row 2, and key the rows by the line they are on:
+
+```js
+'https://docs.google.com/spreadsheets/d/e/.../pub?gid=0&single=true&output=tsv': {
+    delimiter:  '\t',
+    quote:      false,     // TSV has no quoting; a `"` in a cell is a character
+    headerRow:  2,         // row 1: titles for people; row 2: the keys
+    lineColumn: 'row',     // every row gets `row`: 3, 4, 5 … as the sheet numbers them
+    idColumn:   'row',
+    collection: 'documents',
+    prefix:     '/rules/',
+},
+```
+
+A row inserted in the middle moves every row below it down by one line, which reaches the catalog as an update to each of them rather than as a delete and a create. That fits a table read as a whole. For pages addressed by their id, use a real key column.
 
 ## State persistence
 

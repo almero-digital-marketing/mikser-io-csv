@@ -165,3 +165,66 @@ describe('parseCsv — TSV and ragged sheets', () => {
         assert.equal(rows[0].price, '9,300 €')
     })
 })
+
+describe('parseCsv — a header below the first line, and line numbers', () => {
+    // The shape of a sheet written for people and read by a program: a row of
+    // readable titles, then the row of keys, then data. Published to the web as
+    // TSV, which is how a Google Sheet reaches a build.
+    const sheet =
+        'Процедура\tКарта\tПори\n' +
+        'service\tcard\tpores\n' +
+        'dp-pure\tpores\t<= 40\n' +
+        'dp-pure\tpores\t\n' +
+        'clearskin\tpores\t<= 40'
+
+    it('headerRow: 2 takes the column names from line 2 and never reads line 1', () => {
+        const { columns, rows } = parseCsv(sheet, { delimiter: '\t', quote: false, headerRow: 2 })
+        assert.deepEqual(columns, ['service', 'card', 'pores'])
+        assert.equal(rows.length, 3)
+        assert.equal(rows[0].service, 'dp-pure')
+        assert.equal(rows[0].pores, '<= 40')
+    })
+
+    it('without headerRow the titles would name the columns and the keys would be a data row', () => {
+        const { columns, rows } = parseCsv(sheet, { delimiter: '\t', quote: false })
+        assert.deepEqual(columns, ['Процедура', 'Карта', 'Пори'])
+        assert.equal(rows[0]['Процедура'], 'service')
+    })
+
+    it('lineColumn numbers each row by the sheet line it is on, and comes last', () => {
+        // Two rows here share every value that names them, so no column can be
+        // the idColumn; the line can.
+        const { columns, rows } = parseCsv(sheet, { delimiter: '\t', quote: false, headerRow: 2, lineColumn: 'row' })
+        assert.deepEqual(columns, ['service', 'card', 'pores', 'row'])
+        assert.deepEqual(rows.map((r) => r.row), [3, 4, 5])
+    })
+
+    it('a record spanning lines is numbered by the line it starts on, past skipped blank lines', () => {
+        // csv-parse reports the line a record ENDS on; a quoted field with a
+        // newline would otherwise shift every number after it.
+        const csv = 'id,note\na,"two\nlines"\n\nb,plain\nc,last'
+        const { rows } = parseCsv(csv, { lineColumn: 'line' })
+        assert.deepEqual(rows.map((r) => [r.id, r.line]), [['a', 2], ['b', 5], ['c', 6]])
+    })
+
+    it('lineColumn is not coerced and survives coerce: true as a number', () => {
+        const { rows } = parseCsv('id,price\na,1.5', { coerce: true, lineColumn: 'line' })
+        assert.equal(rows[0].price, 1.5)
+        assert.equal(rows[0].line, 2)
+    })
+
+    it('a lineColumn that names an existing column is refused', () => {
+        assert.throws(
+            () => parseCsv('id,row\na,1', { lineColumn: 'row' }),
+            /lineColumn "row" is already a column/,
+        )
+    })
+
+    it('headerRow with headerless: true is refused, and so is a headerRow below 1', () => {
+        assert.throws(
+            () => parseCsv('a,b', { headerless: true, columns: ['x', 'y'], headerRow: 2 }),
+            /headerless: true says there is none/,
+        )
+        assert.throws(() => parseCsv('a,b\n1,2', { headerRow: 0 }), /headerRow must be a line number/)
+    })
+})
