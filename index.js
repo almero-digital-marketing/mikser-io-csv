@@ -101,6 +101,9 @@ export function csv(options = {}) {
         // a journal entry that onProcess (below) picks up and runs the
         // initial fanout for — no separate onImport pass needed.
         const pollTimers = []
+        // The body a poll fetched and found changed, for the fanout of the
+        // cycle it triggers — see `fetched` in lib/fanout.js.
+        const fetchedByParent = new Map()   // parentId → body
         onLoaded(async () => {
             const logger = useLogger()
             for (const [key, entry] of entries) {
@@ -121,6 +124,10 @@ export function csv(options = {}) {
                     // clear it, fanout would re-run, diff would emit
                     // zero row changes — wasteful but quiet.
                     checksum:   existing?.checksum,
+                    // With the body that checksum describes, so a reader
+                    // still gets the bytes the rows came from if the first
+                    // fetch fails. The fanout reads fresh regardless.
+                    content:    existing?.content,
                     meta: {
                         ...(existing?.meta ?? {}),
                         csvSource:     'http',
@@ -140,12 +147,12 @@ export function csv(options = {}) {
                 // Poll timer (watch mode only). Each tick does a CHEAP
                 // change check before disturbing anything — fetch via
                 // the http provider (conditional GET; nearly free when
-                // the upstream serves 304 within its cache window),
-                // checksum the body, compare against the persisted
-                // parent checksum. If unchanged, the tick is silent:
-                // no journal write, no trigger, no render cycle. Only
-                // when the bytes actually differ do we bump the entity
-                // and wake the watch loop.
+                // the upstream serves 304 within its cache window, a full
+                // download when it sends no validators), checksum the
+                // body, compare against the persisted parent checksum.
+                // If unchanged, the tick is silent: no journal write, no
+                // trigger, no render cycle. Only when the bytes actually
+                // differ do we bump the entity and wake the watch loop.
                 //
                 // The previous design bumped on every tick and let the
                 // process cycle discover "nothing changed" via the same
@@ -166,7 +173,10 @@ export function csv(options = {}) {
                             // including any checksum the last fanout left.
                             const current = await findEntity({ id: parentId })
                             if (!current) return        // catalog dropped it; let it stay gone
-                            const content = await readEntityContent(current)
+                            // `reload`: the catalog copy carries the body
+                            // it was last fanned from, and the question
+                            // is what the URL serves now.
+                            const content = await readEntityContent(current, { reload: true })
                             if (content.contentError) {
                                 logger.warn('Csv: poll fetch for %s failed: %s', key, content.contentError)
                                 return
@@ -180,14 +190,15 @@ export function csv(options = {}) {
                             // Changed. Bump entity time so the UPDATE
                             // lands in the journal, then trigger a
                             // cycle to drain it. Fanout in onProcess
-                            // re-fetches (cheap via http provider's
-                            // ETag cache — same response served from
-                            // the in-memory cache), computes the same
-                            // new checksum, mutates current.checksum,
-                            // and runs the row diff. The 1s debounce
-                            // in triggeredHook collapses bursts
-                            // (multiple sources detecting changes in
-                            // the same window) into one cycle.
+                            // parses the body fetched here rather than
+                            // fetching again, stamps its checksum and
+                            // content on the parent, and runs the row
+                            // diff. The 1s debounce in triggeredHook
+                            // collapses bursts (multiple sources
+                            // detecting changes in the same window) into
+                            // one cycle.
+                            logger.info('Csv: %s changed upstream — fanning out again', key)
+                            fetchedByParent.set(parentId, content.content)
                             await updateEntity({ ...current, time: Date.now() })
                             await triggeredHook('csv-poll', { url: key, parentId })
                         } catch (err) {
@@ -244,6 +255,8 @@ export function csv(options = {}) {
                 if (!matched) continue
 
                 const entry = configByKey.get(matched)
+                const fetched = fetchedByParent.get(entity.id)
+                fetchedByParent.delete(entity.id)
                 try {
                     await fanoutParent({
                         parent: entity, key: matched,
@@ -251,6 +264,8 @@ export function csv(options = {}) {
                         compiledFilter: compiledByKey.get(matched),
                         createEntity, updateEntity, deleteEntity,
                         logger,
+                        owned: isUrlKey(matched),
+                        fetched,
                     })
                 } catch (err) {
                     logger.error('Csv: fanout failed for %s — %s', entity.id, err.message)

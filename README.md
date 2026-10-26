@@ -167,14 +167,16 @@ parent CSV entity in catalog (uri = local path / gdrive://... / https://...)
    │
    ▼ fanoutParent:
    │   1. readEntityContent(parent) — substrate-side provider dispatch
-   │      (fs / gdrive / http — whichever scheme the URI has)
+   │      (fs / gdrive / http — whichever scheme the URI has); for a URL
+   │      parent, the body the poll already fetched when it has one
    │   2. sha256 the body → compare against parent.checksum → skip if equal
    │   3. parseCsv + coerce
    │   4. filter (sift) → keep / drop rows
    │   5. indexByKey by idColumn → Map<rowKey, {row, rowHash}>
    │   6. threeWayDiff against mikser_csv_rows
    │   7. emit createEntity / updateEntity / deleteEntity per delta
-   │   8. mutate parent.checksum + parent.meta.csvColumns
+   │   8. mutate parent.checksum + parent.meta.csvColumns, and for a URL
+   │      parent parent.content — the body that checksum describes
    │      (auto-persist via useJournal carries it to mikser_entities)
    │   9. upsert row_hash entries
    │
@@ -187,12 +189,15 @@ Filtered-out rows look indistinguishable from removed rows — they just aren't 
 
 When a match key is an HTTP/HTTPS URL:
 
-1. **At `onLoaded`:** csv plugin creates a parent entity (or updates if it already exists) with `uri = <the URL>`, `meta.httpHeaders = <your headers>`, `meta.httpTimeoutMs = <yours>`. The id is derived from the URL hash (or `parentId` if you set it). On warm restart, the previous run's `parent.checksum` is preserved so the next cycle stays silent when the upstream hasn't drifted.
+1. **At `onLoaded`:** csv plugin creates a parent entity (or updates if it already exists) with `uri = <the URL>`, `meta.httpHeaders = <your headers>`, `meta.httpTimeoutMs = <yours>`. The id is derived from the URL hash (or `parentId` if you set it). On warm restart, the previous run's `parent.checksum` and the body it describes are preserved, so the next cycle stays silent when the upstream hasn't drifted and readers still have the rows' body if the first fetch fails. The fanout fetches the URL afresh either way; the carried body is never taken as what the URL serves now.
 2. **At `onProcess` (cold + warm runs):** the CREATE/UPDATE journal entry from `onLoaded` is yielded; `fanoutParent` runs and ingests rows. No separate `onImport` pass — `onProcess` is the single fanout entrypoint for both startup and steady-state.
-3. **In watch mode:** a `setInterval(pollIntervalMs)` does a **cheap change check at the source** — fetches via the http provider (304 inside the upstream's cache window), checksums the body, compares with the entity's `checksum`. Unchanged → silent return. Changed → bump `parent.time`, call `triggeredHook` to wake the watch loop, and the same `onProcess` path runs fanout. The gate at the poll means an unchanged URL produces zero process cycles.
+3. **In watch mode:** a `setInterval(pollIntervalMs)` does a **cheap change check at the source** — fetches via the http provider (304 inside the upstream's cache window), checksums the body, compares with the entity's `checksum`. Unchanged → silent return. Changed → bump `parent.time`, call `triggeredHook` to wake the watch loop, and the same `onProcess` path runs fanout — on the body the poll fetched, not a second fetch. The gate at the poll means an unchanged URL produces zero process cycles.
 4. **Fetching:** `readEntityContent(parent)` routes to the **built-in `http` provider** (ships in `mikser-io`, no separate package), which sends conditional GETs with `If-None-Match` from its in-memory ETag cache. A 304 reuses the cached body → checksum unchanged → poll returns silent.
+5. **Reading the parent from another plugin:** the fanout leaves the body it parsed on `parent.content`, so `readEntityContent(parent)` in any plugin that runs after csv in the same cycle returns those bytes without fetching — the same bytes the rows and `parent.checksum` came from. Register such a plugin after `csv()`; one before it reads the parent before this cycle's fanout. To ask what the URL serves right now instead, pass `{ reload: true }`.
 
-Effectively: a poll on an unchanged URL costs **one 304 round-trip + a checksum compare** and does not start a process cycle. Polling a 50MB CSV at 60s intervals is nearly free as long as the server sets ETags (S3, GCS, Cloudflare, Netlify, raw.githubusercontent.com all do).
+Effectively: a poll on an unchanged URL costs **one 304 round-trip + a checksum compare** and does not start a process cycle. Polling a 50MB CSV at 60s intervals is nearly free as long as the server sets ETags (S3, GCS, Cloudflare, Netlify, raw.githubusercontent.com all do). A server that sends neither ETag nor Last-Modified — a published Google Sheet among them — is downloaded whole on every poll.
+
+**Why the parent carries its body.** Two fetches of a URL are two reads, and nothing makes them agree. A published Google Sheet sends no validators, so there is nothing to revalidate against, and for a while after a publish its edges serve different versions. A plugin that fetched the sheet again after the fanout could get the other version than the one the rows came from, and since every later poll found the fanout's checksum unchanged and stayed silent, that plugin kept the other version until the sheet changed again or the process restarted. Carrying the body means a cycle has one copy, and every reader in it gets that one. The edges can still answer successive polls differently for a while; each such answer becomes a cycle of its own, in which the rows and every reader agree.
 
 ## End-to-end demo: Google Sheets → product pages
 
@@ -249,7 +254,7 @@ A row inserted in the middle moves every row below it down by one line, which re
 
 ## State persistence
 
-Parent-level state lives **on the parent entity itself** — `parent.checksum` (sha256 of the last successfully-parsed CSV body; the fast skip-if-unchanged gate) and `parent.meta.csvColumns` (column-order snapshot, diagnostic). Both ride on `mikser_entities` via the standard catalog write path, so there's one schema to evolve and one place to look when investigating why a poll didn't pick something up.
+Parent-level state lives **on the parent entity itself** — `parent.checksum` (sha256 of the last successfully-parsed CSV body; the fast skip-if-unchanged gate), `parent.meta.csvColumns` (column-order snapshot, diagnostic) and, for a URL parent, `parent.content` (that body itself — see *Why the parent carries its body*; a glob parent belongs to the source that emitted it and keeps whatever that source put there). All of them ride on `mikser_entities` via the standard catalog write path, so there's one schema to evolve and one place to look when investigating why a poll didn't pick something up. The body costs what it weighs: a URL CSV is stored whole in the catalog and copied through every journal walk that meets the parent — nothing for a sheet, worth knowing for a feed of tens of megabytes.
 
 Per-row state has its own table because there can be many rows per parent and the diff needs them keyed:
 
@@ -263,7 +268,7 @@ mikser_csv_rows (
 
 Lives in `runtime/mikser.sqlite` via `registerSchema`. No FK to `mikser_entities`: `onProcess` runs while the parent's own CREATE journal entry may still be pending, and a FK would block the row-state writes that fanout is producing in the same iteration. Cleanup-on-parent-delete is handled explicitly in the `onProcess` `DELETE` branch (`dropAllForParent` walks the row state and emits `deleteEntity` for each row entity).
 
-`--clear` wipes the catalog (and with it the entity-borne checksum + columns) and forces a fresh fanout regardless of any previous state.
+`--clear` wipes the catalog (and with it the entity-borne checksum, columns and body) and forces a fresh fanout regardless of any previous state.
 
 ## What v1 does NOT cover
 
