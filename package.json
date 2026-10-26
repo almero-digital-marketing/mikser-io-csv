@@ -27,5 +27,8 @@
   },
   "devDependencies": {
     "mikser-io": "^11.0.1"
+  },
+  "allowScripts": {
+    "better-sqlite3": true
   }
 }
