@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-csv",
-  "version": "11.2.0",
+  "version": "11.2.1",
   "description": "CSV-as-source for mikser-io. Local files / Drive sheets exported as CSV / HTTP URL polling — same dispatch. Each row becomes a queryable entity; idColumn picks the stable key; sift-based filter pre-excludes rows; opt-in type coercion; checksum-gated re-emit on parent file change; three-way row diff per refresh.",
   "main": "index.js",
   "type": "module",
