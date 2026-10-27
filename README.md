@@ -26,7 +26,7 @@ This is the "spreadsheet-as-CMS" story for non-technical operators: marketing dr
 npm install mikser-io-csv
 ```
 
-Peer dep on `mikser-io ^11`. Hard deps: `csv-parse` (the parser), `sift` (filter dispatch), `minimatch` (glob match).
+Peer dep on `mikser-io ^11.14.0` (the poll reads `runtime.processing`). Hard deps: `csv-parse` (the parser), `sift` (filter dispatch), `minimatch` (glob match).
 
 ## Two operating modes — one factory
 
@@ -192,6 +192,8 @@ When a match key is an HTTP/HTTPS URL:
 1. **At `onLoaded`:** csv plugin creates a parent entity (or updates if it already exists) with `uri = <the URL>`, `meta.httpHeaders = <your headers>`, `meta.httpTimeoutMs = <yours>`. The id is derived from the URL hash (or `parentId` if you set it). On warm restart, the previous run's `parent.checksum` and the body it describes are preserved, so the next cycle stays silent when the upstream hasn't drifted and readers still have the rows' body if the first fetch fails. The fanout fetches the URL afresh either way; the carried body is never taken as what the URL serves now.
 2. **At `onProcess` (cold + warm runs):** the CREATE/UPDATE journal entry from `onLoaded` is yielded; `fanoutParent` runs and ingests rows. No separate `onImport` pass — `onProcess` is the single fanout entrypoint for both startup and steady-state.
 3. **In watch mode:** a `setInterval(pollIntervalMs)` does a **cheap change check at the source** — fetches via the http provider (304 inside the upstream's cache window), checksums the body, compares with the entity's `checksum`. Unchanged → silent return. Changed → bump `parent.time`, call `triggeredHook` to wake the watch loop, and the same `onProcess` path runs fanout — on the body the poll fetched, not a second fetch. The gate at the poll means an unchanged URL produces zero process cycles.
+
+   The check runs **only between cycles**. A tick that comes due while a cycle runs waits for it to finish, and a change the poll has handed off is not checked again until its cycle has run. Two engine facts make this necessary: a trigger does not queue behind the cycle in flight, it cancels it; and the `checksum` the poll compares against is the catalog's, which a cycle sets only when it persists. A poll that checked mid-cycle saw the old checksum, counted the change the running cycle was applying, and cancelled that cycle — and the next one, every interval, for as long as cycles took longer than `pollIntervalMs`. On a site whose table change sets off minutes of work, that kept a changed row out of the catalog for over half an hour.
 4. **Fetching:** `readEntityContent(parent)` routes to the **built-in `http` provider** (ships in `mikser-io`, no separate package), which sends conditional GETs with `If-None-Match` from its in-memory ETag cache. A 304 reuses the cached body → checksum unchanged → poll returns silent.
 5. **Reading the parent from another plugin:** the fanout leaves the body it parsed on `parent.content`, so `readEntityContent(parent)` in any plugin that runs after csv in the same cycle returns those bytes without fetching — the same bytes the rows and `parent.checksum` came from. Register such a plugin after `csv()`; one before it reads the parent before this cycle's fanout. To ask what the URL serves right now instead, pass `{ reload: true }`.
 
@@ -266,7 +268,9 @@ mikser_csv_rows (
 );
 ```
 
-Lives in `runtime/mikser.sqlite` via `registerSchema`. No FK to `mikser_entities`: `onProcess` runs while the parent's own CREATE journal entry may still be pending, and a FK would block the row-state writes that fanout is producing in the same iteration. Cleanup-on-parent-delete is handled explicitly in the `onProcess` `DELETE` branch (`dropAllForParent` walks the row state and emits `deleteEntity` for each row entity).
+Lives in `runtime/mikser.sqlite` via `registerSchema`. **It is written after the catalog, never before.** The fanout journals each row entity, and the catalog applies the journal at persist; the row hashes wait in memory and reach this table in `onPersisted`. Written at once, they ran ahead of the catalog: a process that died between the fanout and persist — a deploy restarting it mid-cycle — came back with its journal discarded and this table saying the rows were done, so every diff after that found nothing to change and the catalog kept the old rows. A cancelled cycle keeps its staged hashes as it keeps its journal; a dead process loses both.
+
+No FK to `mikser_entities`: `onProcess` runs while the parent's own CREATE journal entry may still be pending, and a FK would block the row-state writes that fanout is producing in the same iteration. Cleanup-on-parent-delete is handled explicitly in the `onProcess` `DELETE` branch (`dropAllForParent` walks the row state and emits `deleteEntity` for each row entity).
 
 `--clear` wipes the catalog (and with it the entity-borne checksum, columns and body) and forces a fresh fanout regardless of any previous state.
 

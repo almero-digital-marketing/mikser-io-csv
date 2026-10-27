@@ -22,7 +22,7 @@ import { readEntityContent } from 'mikser-io'
 import { compileFilter } from './lib/filter.js'
 import { fanoutParent } from './lib/fanout.js'
 import { isUrlKey, findMatchingKey } from './lib/match-key.js'
-import { dropAllForParent } from './lib/state.js'
+import { dropAllForParent, commitStaged } from './lib/state.js'
 import './lib/state.js'   // side-effect: registerSchema
 import { registerCsvProvenance } from './lib/provenance.js'
 
@@ -31,6 +31,9 @@ import { registerCsvProvenance } from './lib/provenance.js'
 // csv, which is a real place to go and edit. Registered once at module scope;
 // it costs nothing until something asks.
 registerCsvProvenance()
+
+// How often a poll that came due during a cycle looks again for its end.
+const CYCLE_WAIT_MS = 1000
 
 function urlToParentId(url, configParentId) {
     if (configParentId) return configParentId
@@ -67,7 +70,7 @@ function validateEntry(key, entry) {
 
 export function csv(options = {}) {
     return ({
-        runtime, onLoaded, onProcess, useLogger, useJournal,
+        runtime, onLoaded, onProcess, onPersisted, onFinalized, useLogger, useJournal,
         createEntity, updateEntity, deleteEntity,
         findEntity,
         triggeredHook,
@@ -102,8 +105,20 @@ export function csv(options = {}) {
         // initial fanout for — no separate onImport pass needed.
         const pollTimers = []
         // The body a poll fetched and found changed, for the fanout of the
-        // cycle it triggers — see `fetched` in lib/fanout.js.
+        // cycle it triggers — see `fetched` in lib/fanout.js. While it is
+        // here that change is still on its way, and the poll leaves the URL
+        // alone.
         const fetchedByParent = new Map()   // parentId → body
+        // `processing` is true for the whole cycle, the gaps between phases
+        // included — which is why this needs mikser-io 11.14.0.
+        const cycleOver = async () => {
+            while (runtime.processing) await new Promise((resolve) => setTimeout(resolve, CYCLE_WAIT_MS))
+        }
+        // A cycle that finished has consumed every body handed to it. One
+        // still here never reached a fanout — its journal entry refused, say
+        // — and left in place it would keep the poll away from that URL for
+        // good.
+        onFinalized(() => fetchedByParent.clear())
         onLoaded(async () => {
             const logger = useLogger()
             for (const [key, entry] of entries) {
@@ -161,11 +176,32 @@ export function csv(options = {}) {
                 // log noise, and at scale (many polled CSVs) wasted
                 // contention on the journal/manifest path. Cheaper to
                 // gate at the source.
+                //
+                // And only between cycles. A trigger does not queue behind
+                // the cycle in flight: it cancels it and starts again. The
+                // checksum the poll compares against is the catalog's, which
+                // a cycle sets only when it persists. So a tick that came
+                // due while the cycle applying a change was still running —
+                // gpoint's re-derives every report when a table changes, for
+                // minutes — saw the old checksum, counted the same change
+                // again and cancelled that cycle. The next cycle went the
+                // same way, every interval, for as long as cycles outlasted
+                // it: 35 minutes of a row the sheet had changed and the
+                // catalog had not.
                 const pollIntervalMs = entry.pollIntervalMs ?? options.pollIntervalMs ?? 60_000
                 if (runtime.options.watch && pollIntervalMs > 0) {
-                    const t = setInterval(async () => {
-                        try {
-                            // Read fresh catalog state each tick — the
+                    const poll = async () => {
+                        while (true) {
+                            await cycleOver()
+                            // A change this poll handed off is still waiting
+                            // for its cycle, which may be starting this very
+                            // moment, and the catalog will not show it until
+                            // that cycle persists. Checking again could only
+                            // count the same change twice — and the second
+                            // trigger, landing once that cycle is running,
+                            // would cancel it.
+                            if (fetchedByParent.has(parentId)) return
+                            // Read fresh catalog state each check — the
                             // closure-captured `parent` from onLoaded
                             // is stale the moment fanout runs the first
                             // time (parent.checksum gets set). findEntity
@@ -177,6 +213,11 @@ export function csv(options = {}) {
                             // it was last fanned from, and the question
                             // is what the URL serves now.
                             const content = await readEntityContent(current, { reload: true })
+                            // A cycle that started during the fetch may be
+                            // the one that applies this very change, and
+                            // `current` is from before it. Ask again once it
+                            // is over, against the catalog it leaves.
+                            if (runtime.processing) continue
                             if (content.contentError) {
                                 logger.warn('Csv: poll fetch for %s failed: %s', key, content.contentError)
                                 return
@@ -201,8 +242,21 @@ export function csv(options = {}) {
                             fetchedByParent.set(parentId, content.content)
                             await updateEntity({ ...current, time: Date.now() })
                             await triggeredHook('csv-poll', { url: key, parentId })
+                            return
+                        }
+                    }
+                    // One check at a time: a tick that finds the last one
+                    // still waiting out a cycle has nothing to add to it.
+                    let checking = false
+                    const t = setInterval(async () => {
+                        if (checking) return
+                        checking = true
+                        try {
+                            await poll()
                         } catch (err) {
                             logger.error('Csv: poll check failed for %s — %s', key, err.message)
+                        } finally {
+                            checking = false
                         }
                     }, pollIntervalMs)
                     t.unref?.()
@@ -218,6 +272,11 @@ export function csv(options = {}) {
         // and runs the initial fanout. Glob-mode parents flow through
         // the same onProcess path naturally — their CREATE/UPDATE
         // entries come from the documents/files/gdrive sources.
+
+        // The row state the fanouts staged, now that the catalog holds the
+        // rows they journalled — see `staged` in lib/state.js. A cycle
+        // cancelled before here keeps them for the one that persists next.
+        onPersisted(() => commitStaged())
 
         onProcess(async (signal) => {
             const logger = useLogger()
